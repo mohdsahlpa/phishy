@@ -1,17 +1,25 @@
 package com.test.phishy
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.InetSocketAddress
+import java.nio.ByteBuffer
+import java.nio.channels.DatagramChannel
 import kotlin.concurrent.thread
 
 class MyVpnService : VpnService() {
@@ -19,210 +27,278 @@ class MyVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var vpnThread: Thread? = null
 
-    // A simple flag to track the service's state
     @Volatile
     private var isRunning = false
 
     companion object {
         const val ACTION_CONNECT = "com.test.phishy.CONNECT"
         const val ACTION_DISCONNECT = "com.test.phishy.DISCONNECT"
-
-        // Broadcast actions for status updates
         const val BROADCAST_VPN_STATE = "com.test.phishy.VPN_STATE"
+        const val BROADCAST_BLOCKED_DOMAIN = "com.test.phishy.BROADCAST_BLOCKED_DOMAIN"
+
+        const val EXTRA_BLOCKED_DOMAIN = "com.test.phishy.EXTRA_BLOCKED_DOMAIN"
         const val EXTRA_VPN_STATE = "com.test.phishy.VPN_STATE_EXTRA"
 
-        private const val NOTIFICATION_CHANNEL_ID = "MyVpnServiceChannel"
-        private const val NOTIFICATION_ID = 1
         private const val TAG = "MyVpnService"
-
-        // VPN Parameters
         private const val VPN_ADDRESS = "10.8.0.2"
-        private const val VPN_ROUTE = "0.0.0.0"
-
-        // This is the key for DNS filtering. We'll route DNS traffic to this local address.
         private const val DNS_SERVER = "10.8.0.1"
+        private const val REAL_DNS_SERVER = "8.8.8.8"
+
+        // --- Notification Constants ---
+        private const val NOTIFICATION_CHANNEL_ID = "VpnServiceChannel"
+        private const val NOTIFICATION_ID = 1
+        private const val BLOCK_WARNING_CHANNEL_ID = "BlockWarningChannel"
+        private var blockNotificationId = 2
     }
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        createServiceNotificationChannel()
+        createBlockWarningNotificationChannel()
+        DomainBlocklist.loadBlocklist(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_CONNECT -> {
-                Log.i(TAG, "Received CONNECT action")
-                startVpn()
-            }
-            ACTION_DISCONNECT -> {
-                Log.i(TAG, "Received DISCONNECT action")
-                stopVpn()
-            }
+            ACTION_CONNECT -> startVpn()
+            ACTION_DISCONNECT -> stopVpn()
         }
-        // If the service is killed, it will be automatically restarted.
         return START_STICKY
     }
 
     private fun startVpn() {
-        if (isRunning) {
-            Log.i(TAG, "VPN is already running.")
-            return
-        }
-
-        val prepareIntent = prepare(this)
-        if (prepareIntent != null) {
-            Log.w(TAG, "VPN not prepared. Requesting permission.")
-            // Send an intent to the activity to request permission.
-            val permissionIntent = Intent(this, MainActivity::class.java).apply {
-                putExtra("VPN_PREPARE_INTENT", prepareIntent)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            startActivity(permissionIntent)
-            return // Wait for the user to grant permission.
-        }
+        if (isRunning) return
 
         try {
-            // Configure the VPN interface
             val builder = Builder()
                 .addAddress(VPN_ADDRESS, 24)
-                .addRoute(VPN_ROUTE, 0)
-                .addDnsServer(DNS_SERVER) // Route DNS requests through the VPN to our local handler.
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer(DNS_SERVER)
                 .setSession(application.getString(R.string.app_name))
                 .setMtu(1500)
 
             vpnInterface = builder.establish() ?: throw IllegalStateException("Failed to establish VPN interface.")
-            Log.i(TAG, "VPN interface established.")
-
             isRunning = true
-
-            // Start the background thread to handle network traffic.
-            vpnThread = thread(start = true, name = "VpnThread") {
-                runVpnLoop(vpnInterface!!)
-            }
-
-            // Start foreground service and update state
-            startForeground(NOTIFICATION_ID, createNotification("VPN Connected"))
+            vpnThread = thread(start = true, name = "VpnThread") { runVpnLoop(vpnInterface!!) }
+            startForeground(NOTIFICATION_ID, createServiceNotification("VPN Connected"))
             broadcastVpnState()
-            Log.i(TAG, "VPN started successfully.")
-
+            Log.i(TAG, "VPN started successfully for all applications.")
         } catch (e: Exception) {
             Log.e(TAG, "Error starting VPN", e)
-            stopVpn() // Clean up on failure.
+            stopVpn()
         }
     }
 
-    /**
-     * This is the core loop for handling VPN traffic.
-     * It's where you'll implement your packet inspection and DNS filtering.
-     */
     private fun runVpnLoop(vpnInterface: ParcelFileDescriptor) {
-        val vpnInput = FileInputStream(vpnInterface.fileDescriptor).channel
-        val vpnOutput = FileOutputStream(vpnInterface.fileDescriptor).channel
+        val vpnInput = FileInputStream(vpnInterface.fileDescriptor)
+        val vpnOutput = FileOutputStream(vpnInterface.fileDescriptor)
+        val packet = ByteBuffer.allocate(32767)
+
+        while (isRunning) {
+            try {
+                val length = vpnInput.read(packet.array())
+                if (length > 0) {
+                    packet.limit(length)
+                    val domain = extractDomain(packet)
+
+                    if (domain != null) {
+                        if (DomainBlocklist.isBlocked(domain)) {
+                            Log.w(TAG, "Blocked adware/tracker site: $domain")
+                            broadcastBlockedDomain(domain)
+                            showBlockWarningNotification(domain)
+                        } else {
+                            forwardDnsPacket(packet, vpnOutput)
+                        }
+                    } else {
+                        vpnOutput.write(packet.array(), 0, length)
+                    }
+                    packet.clear()
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            } catch (e: Exception) {
+                if (isRunning) Log.e(TAG, "Error in VPN loop", e)
+                break
+            }
+        }
+    }
+
+    private fun forwardDnsPacket(requestPacket: ByteBuffer, vpnOutput: FileOutputStream) {
+        val upstreamDns = DatagramChannel.open()
+        protect(upstreamDns.socket())
+        upstreamDns.connect(InetSocketAddress(REAL_DNS_SERVER, 53))
 
         try {
-            // This is a placeholder for your packet processing logic.
-            // In a real implementation, you would read packets from vpnInput,
-            // analyze them, and write them to vpnOutput (or a real network socket).
-            while (isRunning) {
-                // TODO: Implement your custom DNS filtering logic here. 🕵️‍♂️
-                // 1. Read an IP packet from `vpnInput`.
-                // 2. Parse the packet to see if it's a DNS query.
-                //    - It will be a UDP packet.
-                //    - The destination IP will be `DNS_SERVER` (10.8.0.1).
-                //    - The destination port will be 53.
-                // 3. If it is a DNS query, extract the domain name.
-                // 4. Check the domain against your blocklist.
-                // 5. If blocked, drop the packet. If not, forward it to a real DNS server
-                //    (e.g., 8.8.8.8) and write the response back to `vpnOutput`.
-                // 6. For non-DNS packets, you would typically forward them to the internet.
-
-                // For this example, we'll just keep the thread alive.
-                Thread.sleep(100)
+            requestPacket.rewind()
+            upstreamDns.write(requestPacket)
+            val responsePacket = ByteBuffer.allocate(32767)
+            val readBytes = upstreamDns.read(responsePacket)
+            if (readBytes > 0) {
+                responsePacket.limit(readBytes)
+                vpnOutput.write(responsePacket.array(), 0, readBytes)
             }
-        } catch (e: InterruptedException) {
-            Log.i(TAG, "VPN thread interrupted.")
         } catch (e: Exception) {
-            if (isRunning) { // Only log if we weren't expecting to stop.
-                Log.e(TAG, "Error in VPN loop", e)
-            }
+            Log.e(TAG, "Error forwarding DNS packet", e)
         } finally {
-            Log.i(TAG, "VPN loop finished.")
+            upstreamDns.close()
         }
     }
+
+    private fun extractDomain(packet: ByteBuffer): String? {
+        try {
+            val ipHeaderSize = (packet.get(0).toInt() and 0x0F) * 4
+            // Assuming UDP, which has an 8-byte header
+            val dnsPayloadOffset = ipHeaderSize + 8
+
+            if (packet.limit() <= dnsPayloadOffset + 12) return null
+
+            // Create a slice of the buffer that only contains the DNS payload
+            val dnsPayload = packet.duplicate()
+            dnsPayload.position(dnsPayloadOffset)
+
+            // Skip DNS header (12 bytes) to get to the question section
+            dnsPayload.position(dnsPayload.position() + 12)
+
+            return readDomainName(dnsPayload, dnsPayload)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse domain", e)
+            return null
+        }
+    }
+
+    // ✅ FIX: This function is now more robust and correctly handles DNS pointers.
+    private fun readDomainName(readerBuffer: ByteBuffer, entireDnsPayload: ByteBuffer): String? {
+        val domain = StringBuilder()
+        if (!readerBuffer.hasRemaining()) return null
+
+        var length = readerBuffer.get().toInt() and 0xFF
+        while (length != 0) {
+            // Check for DNS pointer compression
+            if ((length and 0xC0) == 0xC0) {
+                if (!readerBuffer.hasRemaining()) return null
+                val offset = ((length and 0x3F) shl 8) + (readerBuffer.get().toInt() and 0xFF)
+
+                // The offset is relative to the start of the DNS payload
+                val newReader = entireDnsPayload.duplicate()
+                if (offset >= newReader.limit()) return null // Invalid offset
+                newReader.position(offset)
+
+                val pointedDomain = readDomainName(newReader, entireDnsPayload)
+                if (pointedDomain != null) {
+                    if (domain.isNotEmpty()) domain.append('.')
+                    domain.append(pointedDomain)
+                }
+                return domain.toString() // Pointers are always the end of a name
+            } else {
+                if (domain.isNotEmpty()) domain.append('.')
+                if (readerBuffer.remaining() < length) return null
+                val domainPart = ByteArray(length)
+                readerBuffer.get(domainPart)
+                domain.append(String(domainPart))
+            }
+
+            if (!readerBuffer.hasRemaining()) return null
+            length = readerBuffer.get().toInt() and 0xFF
+        }
+        return if (domain.isEmpty()) null else domain.toString()
+    }
+
 
     private fun stopVpn() {
         if (!isRunning) return
-
-        Log.i(TAG, "Stopping VPN...")
         isRunning = false
-        vpnThread?.interrupt() // Signal the thread to stop.
-
+        vpnThread?.interrupt()
         try {
             vpnInterface?.close()
-            vpnInterface = null
         } catch (e: Exception) {
             Log.e(TAG, "Error closing VPN interface", e)
         }
-
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        broadcastVpnState() // Notify the UI that the VPN has stopped.
+        broadcastVpnState()
         Log.i(TAG, "VPN stopped.")
     }
 
     private fun broadcastVpnState() {
-        val intent = Intent(BROADCAST_VPN_STATE).apply {
-            putExtra(EXTRA_VPN_STATE, isRunning)
-        }
-        sendBroadcast(intent)
+        sendBroadcast(Intent(BROADCAST_VPN_STATE).apply { putExtra(EXTRA_VPN_STATE, isRunning) })
+    }
+
+    private fun broadcastBlockedDomain(domain: String) {
+        sendBroadcast(Intent(BROADCAST_BLOCKED_DOMAIN).apply { putExtra(EXTRA_BLOCKED_DOMAIN, domain) })
     }
 
     override fun onRevoke() {
-        Log.w(TAG, "VPN permission revoked by user!")
         stopVpn()
         super.onRevoke()
     }
 
     override fun onDestroy() {
-        Log.i(TAG, "VpnService onDestroy")
-        stopVpn() // Ensure cleanup.
+        stopVpn()
         super.onDestroy()
     }
 
-    // --- Notification Management ---
-
-    private fun createNotificationChannel() {
+    private fun createServiceNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 NOTIFICATION_CHANNEL_ID,
-                "VPN Service Channel",
+                "VPN Service Status",
                 NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
-                description = "Notifications for VPN service status"
+                description = "Notifications for the active VPN connection"
             }
-            val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            val notificationManager: NotificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             notificationManager.createNotificationChannel(channel)
         }
     }
 
-    private fun createNotification(text: String): Notification {
-        val disconnectIntent = Intent(this, MyVpnService::class.java).apply {
-            action = ACTION_DISCONNECT
+    private fun createBlockWarningNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                BLOCK_WARNING_CHANNEL_ID,
+                "Blocked Site Warnings",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Shows a warning when a malicious or ad site is blocked"
+            }
+            val notificationManager: NotificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
         }
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
+    }
+
+    private fun createServiceNotification(text: String): Notification {
+        val disconnectIntent = Intent(this, MyVpnService::class.java).apply { action = ACTION_DISCONNECT }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0
         val disconnectPendingIntent = PendingIntent.getService(this, 0, disconnectIntent, flags)
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
-            .setSmallIcon(R.drawable.ic_launcher_foreground) // Replace with your app's icon
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
             .addAction(R.drawable.ic_launcher_foreground, "Disconnect", disconnectPendingIntent)
             .setOngoing(true)
-            .setSilent(true) // Prevent sound on every update.
+            .setSilent(true)
             .build()
+    }
+
+    private fun showBlockWarningNotification(domain: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                Log.w(TAG, "POST_NOTIFICATIONS permission not granted.")
+                return
+            }
+        }
+
+        val notification = NotificationCompat.Builder(this, BLOCK_WARNING_CHANNEL_ID)
+            .setContentTitle("Site Blocked")
+            .setContentText("Phishy Guard blocked access to: $domain")
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+
+        with(NotificationManagerCompat.from(this)) {
+            notify(blockNotificationId++, notification)
+        }
     }
 }
